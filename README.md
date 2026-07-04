@@ -10,35 +10,39 @@ pinned: false
 
 # Medical Research Assistant
 
-Simple RAG chatbot for medical research PDFs. **One file:** `app.py`
+3 files, easy to understand:
 
-## How to use on Hugging Face Space
+| File | Role |
+|------|------|
+| `rag.py` | Brain — read PDF, store chunks, answer questions |
+| `api.py` | Backend — FastAPI routes `/index` and `/chat` |
+| `streamlit_app.py` | Frontend — upload UI + chat |
 
-1. Add secret: **GOOGLE_API_KEY** (from https://aistudio.google.com/apikey)
-2. Open your Space
-3. **Step 1:** Upload PDF → click **Index PDFs** → wait 1-2 min
-4. **Step 2:** Ask questions in chat
-
-## How RAG works
+## How it works
 
 ```
-PDF upload → split into chunks → save to ChromaDB
-Question   → find similar chunks → Gemini writes answer + cites page
+User uploads PDF in Streamlit
+    → api.py receives file
+    → rag.py reads PDF, saves to ChromaDB
+
+User asks question in Streamlit
+    → api.py receives question
+    → rag.py finds similar chunks → Gemini answers
 ```
+
+## Hugging Face Space setup
+
+1. Add secret: `GOOGLE_API_KEY`
+2. Push code and wait for build
+3. Upload PDF → click **Index PDFs**
+4. Ask questions
 
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
 set GOOGLE_API_KEY=your_key
-streamlit run app.py
+bash start.sh
 ```
 
-## Files
-
-| File | What it does |
-|------|--------------|
-| `app.py` | Everything — upload, index, chat |
-| `requirements.txt` | Python packages |
-| `Dockerfile` | HF Space build |
-| `start.sh` | Starts the app |
+Open http://localhost:8501
