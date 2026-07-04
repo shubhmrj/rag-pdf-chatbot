@@ -120,7 +120,11 @@ def ask(question):
         db = Chroma(
             persist_directory=str(DB_DIR), embedding_function=_get_embeddings()
         )
-        llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=api_key,
+            temperature=0,
+        )
 
         prompt = PromptTemplate(
             input_variables=["context", "question"],
@@ -148,9 +152,15 @@ Answer:""",
             return_source_documents=True,
         )
 
-    result = _chain({"query": question})
+    try:
+        result = _chain.invoke({"query": question})
+    except Exception as exc:
+        reset_chain()
+        return f"Could not get answer from Gemini: {exc}", []
+
+    answer = result.get("result") or result.get("answer") or str(result)
     sources = list({
         f"{d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}"
         for d in result.get("source_documents", [])
     })
-    return result["result"], sources
+    return answer, sources

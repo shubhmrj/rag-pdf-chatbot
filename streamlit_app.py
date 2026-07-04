@@ -16,12 +16,22 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 
-def api_get(path):
-    return requests.get(f"{API}{path}", timeout=10).json()
+def call_api(method, path, timeout=120, **kwargs):
+    url = f"{API}{path}"
+    resp = requests.request(method, url, timeout=timeout, **kwargs)
 
+    if not resp.text.strip():
+        raise RuntimeError(f"Empty response from API ({resp.status_code})")
 
-def api_post(path, **kwargs):
-    return requests.post(f"{API}{path}", timeout=120, **kwargs).json()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Bad API response: {resp.text[:300]}")
+
+    if resp.status_code >= 400:
+        raise RuntimeError(data.get("detail", resp.text[:300]))
+
+    return data
 
 
 # --- Step 1: Upload ---
@@ -35,14 +45,14 @@ if st.button("Index PDFs", type="primary"):
         with st.spinner("Indexing PDFs... wait 1-2 minutes."):
             try:
                 files = [("files", (f.name, f.getvalue(), "application/pdf")) for f in uploaded]
-                resp = api_post("/index", files=files)
+                resp = call_api("POST", "/index", files=files, timeout=300)
                 st.success(resp["message"]) if resp["ok"] else st.error(resp["message"])
             except Exception as exc:
-                st.error(f"Could not reach API. Is the backend running? {exc}")
+                st.error(f"Index error: {exc}")
 
 # --- Step 2: Chat ---
 try:
-    ready = api_get("/status")["ready"]
+    ready = call_api("GET", "/status", timeout=10)["ready"]
 except Exception:
     ready = False
 
@@ -60,8 +70,8 @@ if prompt := st.chat_input("Ask about your research paper...", disabled=not read
     st.session_state.history.append({"role": "user", "content": prompt})
     with st.spinner("Thinking..."):
         try:
-            resp = api_post("/chat", json={"question": prompt})
-            answer = resp["answer"]
+            resp = call_api("POST", "/chat", json={"question": prompt}, timeout=300)
+            answer = resp.get("answer", "No answer returned.")
             if resp.get("sources"):
                 answer += "\n\n**Sources:** " + ", ".join(resp["sources"])
         except Exception as exc:

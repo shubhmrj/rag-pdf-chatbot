@@ -1,6 +1,5 @@
 """
 FastAPI backend — connects the UI to RAG logic.
-Run: uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
 from fastapi import FastAPI, File, UploadFile
@@ -22,24 +21,29 @@ def status():
 
 @app.post("/index")
 async def index(files: list[UploadFile] = File(...)):
-    if not files:
-        return {"ok": False, "message": "No files uploaded."}
+    try:
+        if not files:
+            return {"ok": False, "message": "No files uploaded."}
 
-    file_data = []
-    for f in files:
-        content = await f.read()
-        if not content:
-            continue
-        file_data.append((f.filename, content))
+        file_data = []
+        for f in files:
+            content = await f.read()
+            if content:
+                file_data.append((f.filename, content))
 
-    if not file_data:
-        return {"ok": False, "message": "All uploaded files were empty."}
+        if not file_data:
+            return {"ok": False, "message": "All uploaded files were empty."}
 
-    ok, message = index_pdfs(file_data)
-    return {"ok": ok, "message": message}
+        ok, message = index_pdfs(file_data)
+        return {"ok": ok, "message": message}
+    except Exception as exc:
+        return {"ok": False, "message": f"Index failed: {exc}"}
 
 
 @app.post("/chat")
 def chat(q: Question):
-    answer, sources = ask(q.question)
-    return {"answer": answer, "sources": sources}
+    try:
+        answer, sources = ask(q.question)
+        return {"ok": True, "answer": answer, "sources": sources}
+    except Exception as exc:
+        return {"ok": False, "answer": f"Chat failed: {exc}", "sources": []}
