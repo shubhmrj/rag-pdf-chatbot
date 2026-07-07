@@ -1,7 +1,3 @@
-"""
-RAG logic — read PDFs, store in ChromaDB, answer with Groq LLM.
-"""
-
 import os
 import re
 import shutil
@@ -149,7 +145,11 @@ def ask(question: str):
     })
 
     try:
-        client = Groq(api_key=api_key)
+        client = Groq(
+            api_key=api_key,
+            base_url=os.getenv("GROQ_BASE_URL", None),
+            max_retries=3,
+        )
         response = client.chat.completions.create(
             model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
             messages=[
@@ -171,6 +171,12 @@ def ask(question: str):
         )
         answer = response.choices[0].message.content or "No answer returned."
     except Exception as exc:
+        msg = str(exc)
+        if "Connection" in msg or "ConnectError" in msg or "Network" in msg:
+            return (
+                "Groq API error: connection failed. Check network access, proxy settings, and that the deployment can reach Groq API.",
+                sources,
+            )
         return f"Groq API error: {exc}", sources
 
     return answer, sources
