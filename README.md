@@ -10,29 +10,17 @@ pinned: false
 
 # Medical Research Assistant
 
-3 files, easy to understand:
+RAG chatbot for medical research PDFs. Uses **Groq** (free tier) for answers.
 
 | File | Role |
 |------|------|
-| `rag.py` | Brain — read PDF, store chunks, answer questions |
-| `api.py` | Backend — FastAPI routes `/index` and `/chat` |
-| `streamlit_app.py` | Frontend — upload UI + chat |
-
-## How it works
-
-```
-User uploads PDF in Streamlit
-    → api.py receives file
-    → rag.py reads PDF, saves to ChromaDB
-
-User asks question in Streamlit
-    → api.py receives question
-    → rag.py finds similar chunks → Gemini answers
-```
+| `rag.py` | Read PDF, store chunks, answer with Groq |
+| `api.py` | FastAPI backend |
+| `streamlit_app.py` | Upload + chat UI |
 
 ## Hugging Face Space setup
 
-1. Add secret: `GOOGLE_API_KEY`
+1. Settings → Secrets → add **`GROQ_API_KEY`** (from https://console.groq.com)
 2. Push code and wait for build
 3. Upload PDF → click **Index PDFs**
 4. Ask questions
@@ -41,8 +29,14 @@ User asks question in Streamlit
 
 ```bash
 pip install -r requirements.txt
-set GOOGLE_API_KEY=your_key
+copy .env.example .env
+# put your GROQ_API_KEY in .env
 bash start.sh
 ```
 
 Open http://localhost:8501
+
+## Notes
+
+- PDF must have **selectable text** (not scanned images)
+- Default model: `llama-3.1-8b-instant` (fast, free on Groq)

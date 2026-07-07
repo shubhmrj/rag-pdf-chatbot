@@ -20,16 +20,16 @@ def status():
 
 
 @app.post("/index")
-async def index(files: list[UploadFile] = File(...)):
+async def index_documents(files: list[UploadFile] = File(...)):
     try:
         if not files:
             return {"ok": False, "message": "No files uploaded."}
 
-        file_data = []
-        for f in files:
-            content = await f.read()
-            if content:
-                file_data.append((f.filename, content))
+        file_data: list[tuple[str, bytes]] = []
+        for upload in files:
+            content = await upload.read()
+            if content and upload.filename:
+                file_data.append((upload.filename, content))
 
         if not file_data:
             return {"ok": False, "message": "All uploaded files were empty."}

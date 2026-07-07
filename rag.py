@@ -1,11 +1,9 @@
 """
-RAG logic — the brain of the app.
-
-Step 1: index_pdfs()  → read PDF, split text, save to ChromaDB
-Step 2: ask()         → find relevant chunks, send to Gemini, return answer
+RAG logic — read PDFs, store in ChromaDB, answer with Groq LLM.
 """
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -14,8 +12,11 @@ from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
 load_dotenv()
@@ -27,61 +28,115 @@ _embeddings = None
 _chain = None
 
 
+class LocalEmbeddings(Embeddings):
+    def __init__(self):
+        self._model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._model.encode(texts, convert_to_numpy=True).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._model.encode([text], convert_to_numpy=True).tolist()[0]
+
+
 def _get_embeddings():
-    """Turn text into numbers (vectors) so we can search similar text."""
     global _embeddings
-    if _embeddings is not None:
-        return _embeddings
-
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    class Embeddings:
-        def embed_documents(self, texts):
-            return model.encode(texts, convert_to_numpy=True).tolist()
-
-        def embed_query(self, text):
-            return model.encode([text], convert_to_numpy=True).tolist()[0]
-
-    _embeddings = Embeddings()
+    if _embeddings is None:
+        _embeddings = LocalEmbeddings()
     return _embeddings
 
 
 def reset_chain():
-    """Call after indexing new PDFs so the chat uses fresh data."""
     global _chain
     _chain = None
 
 
 def is_ready():
-    return DB_DIR.exists()
+    return DB_DIR.exists() and any(DB_DIR.iterdir())
 
 
-def index_pdfs(files):
-    """
-    Index PDF files.
-    files = list of (filename, bytes) tuples
-    """
+def _clean_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _load_pdf(path: Path) -> list[Document]:
+    """Extract text from a PDF using PyPDFLoader, with pypdf fallback."""
+    pages: list[Document] = []
+
+    try:
+        for doc in PyPDFLoader(str(path)).load():
+            text = _clean_text(doc.page_content)
+            if text:
+                pages.append(
+                    Document(page_content=text, metadata=doc.metadata or {"source": str(path)})
+                )
+    except Exception:
+        pages = []
+
+    if pages:
+        return pages
+
+    try:
+        reader = PdfReader(str(path))
+        for i, page in enumerate(reader.pages):
+            text = _clean_text(page.extract_text() or "")
+            if text:
+                pages.append(
+                    Document(
+                        page_content=text,
+                        metadata={"source": str(path), "page": i},
+                    )
+                )
+    except Exception as exc:
+        raise ValueError(f"Could not read {path.name}: {exc}") from exc
+
+    return pages
+
+
+def index_pdfs(files: list[tuple[str, bytes]]):
+    """Save PDF bytes to disk and build the Chroma vector store."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    saved_paths = []
+    saved_paths: list[Path] = []
     for name, content in files:
-        path = DATA_DIR / name
+        if not name or not content:
+            continue
+        safe_name = Path(name).name
+        path = DATA_DIR / safe_name
         path.write_bytes(content)
         saved_paths.append(path)
 
-    pages = []
-    for path in saved_paths:
-        pages.extend(PyPDFLoader(str(path)).load())
+    if not saved_paths:
+        return False, "No valid PDF files were uploaded."
 
-    if not pages:
-        return False, "Could not read text from the PDFs."
+    all_pages: list[Document] = []
+    errors: list[str] = []
+
+    for path in saved_paths:
+        try:
+            pages = _load_pdf(path)
+            if pages:
+                all_pages.extend(pages)
+            else:
+                errors.append(f"{path.name}: no readable text (maybe scanned/image PDF)")
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+
+    if not all_pages:
+        detail = "; ".join(errors) if errors else "unknown error"
+        return False, f"Could not extract text from PDFs. {detail}"
 
     chunks = RecursiveCharacterTextSplitter(
-        chunk_size=500, chunk_overlap=50
-    ).split_documents(pages)
+        chunk_size=500,
+        chunk_overlap=50,
+        length_function=len,
+    ).split_documents(all_pages)
 
+    chunks = [c for c in chunks if c.page_content.strip()]
     if not chunks:
-        return False, "No text chunks were created from the PDFs."
+        return False, "PDF had text but chunking failed. Try a different PDF."
 
     if DB_DIR.exists():
         shutil.rmtree(DB_DIR)
@@ -89,40 +144,36 @@ def index_pdfs(files):
     embeddings = _get_embeddings()
     batch_size = 100
 
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
-        if i == 0:
-            Chroma.from_documents(
-                batch, embeddings, persist_directory=str(DB_DIR)
-            )
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start : start + batch_size]
+        if start == 0:
+            Chroma.from_documents(batch, embeddings, persist_directory=str(DB_DIR))
         else:
-            db = Chroma(
-                persist_directory=str(DB_DIR), embedding_function=embeddings
-            )
+            db = Chroma(persist_directory=str(DB_DIR), embedding_function=embeddings)
             db.add_documents(batch)
 
     reset_chain()
-    return True, f"Indexed {len(chunks)} chunks from {len(saved_paths)} PDF(s)."
+    msg = f"Indexed {len(chunks)} chunks from {len(saved_paths)} PDF(s)."
+    if errors:
+        msg += f" Warning: {'; '.join(errors)}"
+    return True, msg
 
 
-def ask(question):
-    """Answer a question using indexed PDFs."""
+def ask(question: str):
     global _chain
 
     if not is_ready():
         return "Upload and index a PDF first.", []
 
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return "GOOGLE_API_KEY is missing. Add it in HF Space Secrets.", []
+        return "GROQ_API_KEY is missing. Add it in .env or HF Space Secrets.", []
 
     if _chain is None:
-        db = Chroma(
-            persist_directory=str(DB_DIR), embedding_function=_get_embeddings()
-        )
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            google_api_key=api_key,
+        db = Chroma(persist_directory=str(DB_DIR), embedding_function=_get_embeddings())
+        llm = ChatGroq(
+            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            groq_api_key=api_key,
             temperature=0,
         )
 
@@ -156,11 +207,11 @@ Answer:""",
         result = _chain.invoke({"query": question})
     except Exception as exc:
         reset_chain()
-        return f"Could not get answer from Gemini: {exc}", []
+        return f"Groq API error: {exc}", []
 
     answer = result.get("result") or result.get("answer") or str(result)
     sources = list({
-        f"{d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}"
+        f"{Path(d.metadata.get('source', '?')).name} p.{d.metadata.get('page', '?')}"
         for d in result.get("source_documents", [])
     })
     return answer, sources
