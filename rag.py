@@ -8,16 +8,13 @@ import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from groq import Groq
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
-from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -25,30 +22,13 @@ DATA_DIR = Path("./data")
 DB_DIR = Path("./chroma_db")
 
 _embeddings = None
-_chain = None
-
-
-class LocalEmbeddings(Embeddings):
-    def __init__(self):
-        self._model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._model.encode(texts, convert_to_numpy=True).tolist()
-
-    def embed_query(self, text: str) -> list[float]:
-        return self._model.encode([text], convert_to_numpy=True).tolist()[0]
 
 
 def _get_embeddings():
     global _embeddings
     if _embeddings is None:
-        _embeddings = LocalEmbeddings()
+        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _embeddings
-
-
-def reset_chain():
-    global _chain
-    _chain = None
 
 
 def is_ready():
@@ -57,12 +37,10 @@ def is_ready():
 
 def _clean_text(text: str) -> str:
     text = text.replace("\x00", " ")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _load_pdf(path: Path) -> list[Document]:
-    """Extract text from a PDF using PyPDFLoader, with pypdf fallback."""
     pages: list[Document] = []
 
     try:
@@ -70,7 +48,10 @@ def _load_pdf(path: Path) -> list[Document]:
             text = _clean_text(doc.page_content)
             if text:
                 pages.append(
-                    Document(page_content=text, metadata=doc.metadata or {"source": str(path)})
+                    Document(
+                        page_content=text,
+                        metadata=doc.metadata or {"source": str(path)},
+                    )
                 )
     except Exception:
         pages = []
@@ -78,33 +59,27 @@ def _load_pdf(path: Path) -> list[Document]:
     if pages:
         return pages
 
-    try:
-        reader = PdfReader(str(path))
-        for i, page in enumerate(reader.pages):
-            text = _clean_text(page.extract_text() or "")
-            if text:
-                pages.append(
-                    Document(
-                        page_content=text,
-                        metadata={"source": str(path), "page": i},
-                    )
+    reader = PdfReader(str(path))
+    for i, page in enumerate(reader.pages):
+        text = _clean_text(page.extract_text() or "")
+        if text:
+            pages.append(
+                Document(
+                    page_content=text,
+                    metadata={"source": str(path), "page": i},
                 )
-    except Exception as exc:
-        raise ValueError(f"Could not read {path.name}: {exc}") from exc
-
+            )
     return pages
 
 
 def index_pdfs(files: list[tuple[str, bytes]]):
-    """Save PDF bytes to disk and build the Chroma vector store."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     saved_paths: list[Path] = []
     for name, content in files:
         if not name or not content:
             continue
-        safe_name = Path(name).name
-        path = DATA_DIR / safe_name
+        path = DATA_DIR / Path(name).name
         path.write_bytes(content)
         saved_paths.append(path)
 
@@ -120,98 +95,82 @@ def index_pdfs(files: list[tuple[str, bytes]]):
             if pages:
                 all_pages.extend(pages)
             else:
-                errors.append(f"{path.name}: no readable text (maybe scanned/image PDF)")
+                errors.append(f"{path.name}: no readable text (scanned/image PDF?)")
         except Exception as exc:
             errors.append(f"{path.name}: {exc}")
 
     if not all_pages:
-        detail = "; ".join(errors) if errors else "unknown error"
-        return False, f"Could not extract text from PDFs. {detail}"
+        return False, "Could not extract text. " + "; ".join(errors)
 
     chunks = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
-        length_function=len,
+        chunk_size=500, chunk_overlap=50
     ).split_documents(all_pages)
-
     chunks = [c for c in chunks if c.page_content.strip()]
+
     if not chunks:
-        return False, "PDF had text but chunking failed. Try a different PDF."
+        return False, "PDF had text but chunking failed."
 
     if DB_DIR.exists():
         shutil.rmtree(DB_DIR)
 
-    embeddings = _get_embeddings()
-    batch_size = 100
+    Chroma.from_documents(
+        chunks,
+        _get_embeddings(),
+        persist_directory=str(DB_DIR),
+    )
 
-    for start in range(0, len(chunks), batch_size):
-        batch = chunks[start : start + batch_size]
-        if start == 0:
-            Chroma.from_documents(batch, embeddings, persist_directory=str(DB_DIR))
-        else:
-            db = Chroma(persist_directory=str(DB_DIR), embedding_function=embeddings)
-            db.add_documents(batch)
-
-    reset_chain()
     msg = f"Indexed {len(chunks)} chunks from {len(saved_paths)} PDF(s)."
     if errors:
-        msg += f" Warning: {'; '.join(errors)}"
+        msg += " Note: " + "; ".join(errors)
     return True, msg
 
 
 def ask(question: str):
-    global _chain
-
     if not is_ready():
         return "Upload and index a PDF first.", []
 
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return "GROQ_API_KEY is missing. Add it in .env or HF Space Secrets.", []
+        return "GROQ_API_KEY missing. Add it in .env or HF Space Secrets.", []
 
-    if _chain is None:
-        db = Chroma(persist_directory=str(DB_DIR), embedding_function=_get_embeddings())
-        llm = ChatGroq(
-            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-            groq_api_key=api_key,
-            temperature=0,
-        )
+    db = Chroma(
+        persist_directory=str(DB_DIR),
+        embedding_function=_get_embeddings(),
+    )
+    docs = db.similarity_search(question, k=4)
 
-        prompt = PromptTemplate(
-            input_variables=["context", "question"],
-            template="""You are a medical research assistant. Use ONLY the context below.
+    if not docs:
+        return "No matching content found in the indexed PDF.", []
 
-Context:
-{context}
-
-Question: {question}
-
-Rules:
-- Answer only from the context
-- If not in the context, say "I don't know"
-- Cite source file and page number
-- For research only, not personal medical advice
-
-Answer:""",
-        )
-
-        _chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=db.as_retriever(search_kwargs={"k": 4}),
-            chain_type_kwargs={"prompt": prompt},
-            return_source_documents=True,
-        )
-
-    try:
-        result = _chain.invoke({"query": question})
-    except Exception as exc:
-        reset_chain()
-        return f"Groq API error: {exc}", []
-
-    answer = result.get("result") or result.get("answer") or str(result)
+    context = "\n\n".join(d.page_content for d in docs)
     sources = list({
         f"{Path(d.metadata.get('source', '?')).name} p.{d.metadata.get('page', '?')}"
-        for d in result.get("source_documents", [])
+        for d in docs
     })
+
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a medical research assistant. "
+                        "Answer ONLY from the provided context. "
+                        "If the answer is not in the context, say 'I don't know'. "
+                        "Cite source file and page. Research use only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Context:\n{context}\n\nQuestion: {question}",
+                },
+            ],
+            temperature=0,
+        )
+        answer = response.choices[0].message.content or "No answer returned."
+    except Exception as exc:
+        return f"Groq API error: {exc}", sources
+
     return answer, sources
