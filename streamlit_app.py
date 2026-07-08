@@ -1,7 +1,8 @@
+import os
 import requests
 import streamlit as st
 
-API = "http://localhost:8000"
+API = os.getenv("API_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="Medical Research Assistant", page_icon="🩺")
 st.title("🩺 Medical Research Assistant")
@@ -72,10 +73,18 @@ else:
     st.info("No documents indexed yet. Complete Step 1 first.")
 
 for msg in st.session_state.history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    role = msg.get("role", "assistant")
+    content = msg.get("content", "")
+    if role == "user":
+        st.markdown(f"**You:** {content}")
+    else:
+        st.markdown(f"**Assistant:** {content}")
 
-if prompt := st.chat_input("Ask about your research paper...", disabled=not ready):
+with st.form("chat_form"):
+    prompt = st.text_input("Ask about your research paper...", disabled=not ready)
+    submit = st.form_submit_button("Send")
+
+if submit and prompt:
     st.session_state.history.append({"role": "user", "content": prompt})
     with st.spinner("Thinking..."):
         try:
@@ -87,4 +96,3 @@ if prompt := st.chat_input("Ask about your research paper...", disabled=not read
         except Exception as exc:
             answer = f"Error: {exc}"
     st.session_state.history.append({"role": "assistant", "content": answer})
-    st.rerun()
